@@ -59,11 +59,35 @@ for (const path of ["/v1/models", "/models", "/v1/models/", "/models/"]) {
 }
 
 {
+  const res = await serveHandler(new Request("https://proxy.example/v1/images/generations", {
+    method: "POST",
+    headers: { "content-type": "application/json", Authorization: "Bearer k" },
+    body: JSON.stringify({ model: "grok-2-image-1212", prompt: "a cat" }),
+  }));
+  check("/v1/images/generations 路由到代理", res.status === 200, res.status);
+}
+
+{
+  const form = new FormData();
+  form.append("model", "grok-imagine-image");
+  form.append("prompt", "make it blue");
+  form.append("image", new File([new Uint8Array([137, 80, 78, 71])], "a.png", { type: "image/png" }));
+  const res = await serveHandler(new Request("https://proxy.example/v1/images/edits", {
+    method: "POST",
+    headers: { Authorization: "Bearer k" },
+    body: form,
+  }));
+  check("/v1/images/edits 路由到代理", res.status === 200, res.status);
+}
+
+{
   const res = await serveHandler(new Request("https://proxy.example/health"));
   check("非 API 路径返回 ok", (await res.text()) === "ok", res.status);
 }
 
 check("上游地址为 api.x.ai/v1/models", calls.some((u) => u === "https://api.x.ai/v1/models"), calls.join());
+check("上游地址为 api.x.ai/v1/images/generations", calls.some((u) => u === "https://api.x.ai/v1/images/generations"), calls.join());
+check("上游地址为 api.x.ai/v1/images/edits", calls.some((u) => u === "https://api.x.ai/v1/images/edits"), calls.join());
 
 console.log(`\n${failures.length === 0 ? "ALL PASS" : "FAILED"}: ${pass} passed, ${failures.length} failed`);
 process.exit(failures.length === 0 ? 0 : 1);

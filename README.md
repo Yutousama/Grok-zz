@@ -37,6 +37,20 @@
 - 模型名会原样透传给上游（只去掉 `models/` 前缀），不再静默替换成默认模型；名字写错时直接看到上游的 400 报错，便于排查。
 - `/v1/models` 兼容上游的多种返回结构（`data` / `models` / 直接数组，`id` / `name` 字段都行）；上游返回空列表时兜底返回一组内置模型名，避免 new-api 里模型列表为空。
 
+## 图像生成 / 图像编辑
+
+代理转发 xAI 的两个图像端点，路径与 OpenAI 一致：
+
+| 端点 | 说明 | xAI 上游要求 |
+| --- | --- | --- |
+| `POST /v1/images/generations` | 文本生图 | `application/json` |
+| `POST /v1/images/edits` | 图生图 / 图片编辑 | **只接受 `application/json`**（multipart 会返回 415） |
+
+- 常用模型：`grok-2-image-1212`（经典生图）、`grok-imagine-image`（Imagine 系列，支持编辑与 `resolution`）；具体哪些模型对你的账户开放，以 `/v1/models` 与 xAI 控制台为准。
+- **edits 的格式差异已由代理处理**：OpenAI SDK / new-api 默认发 `multipart/form-data`，代理会转成 xAI 的 JSON（单图 `image: { url, type: "image_url" }`，多图 `images: [...]`（最多 3 张），`mask: { url }`，图片本体转成 `data:image/...;base64,...`）。直接发 JSON 时原样透传。
+- xAI 不支持 OpenAI 的 `size` / `quality` / `style`，这些字段会被丢弃（日志里会提示）；尺寸用 `aspect_ratio`，清晰度用 `resolution: "1k" | "2k"`。
+- 响应统一是 `{ created, data: [{ url | b64_json }] }`，与 OpenAI 一致；需要 base64 时传 `response_format: "b64_json"`。
+
 ### 可选环境变量
 
 在 Deno Deploy 控制台 → 项目 → Settings → Environment Variables 中配置，不配置则使用默认值：
@@ -53,6 +67,7 @@
 ```bash
 node tests/smoke.mjs     # 桩掉 fetch，验证上游各种返回格式/错误都不会让代理崩溃
 node tests/routing.mjs   # 用 Deno 桩加载 deno_index.ts，验证各路径路由
+node tests/images.mjs    # 图像接口：generations 透传、multipart → xAI JSON、415 透传
 # 或：npm test
 ```
 

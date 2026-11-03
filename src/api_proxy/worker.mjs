@@ -33,6 +33,14 @@ export default {
           assert(request.method === "GET");
           return handleModels(apiKey)
             .catch(errHandler);
+        case pathname.endsWith("/images/generations"):
+          assert(request.method === "POST");
+          return handleImageGenerations(request, apiKey)
+            .catch(errHandler);
+        case pathname.endsWith("/images/edits"):
+          assert(request.method === "POST");
+          return handleImageEdits(request, apiKey)
+            .catch(errHandler);
         default:
           throw new HttpError("404 Not Found", 404);
       }
@@ -275,6 +283,133 @@ async function handleCompletions (req, apiKey) {
   }
 
   return new Response(body, fixCors(upstreamHeaders(response)));
+}
+
+// ---------------------------------------------------------------------------
+// 图像接口
+//   POST /v1/images/generations  文本生图，xAI 为 OpenAI 兼容的 JSON
+//   POST /v1/images/edits        图生图/图片编辑
+// 注意：xAI 的 /v1/images/edits 只接受 application/json（OpenAI SDK / new-api
+// 默认发 multipart/form-data，会拿到 415），所以这里把表单转换成 xAI 的 JSON：
+//   image: { url, type: "image_url" }   单图（url 可为 data:image/png;base64,...）
+//   images: [{ url, type: "image_url" }] 多图参考（最多 3 张）
+//   mask:  { url }
+// ---------------------------------------------------------------------------
+
+// /images/edits 允许透传给上游的字段（xAI 规范之外的字段会被丢弃并打日志）
+const IMAGE_EDIT_FIELDS = new Set([
+  "model", "prompt", "n", "response_format",
+  "aspect_ratio", "resolution", "output_format", "sync_mode", "user",
+]);
+const IMAGE_EDIT_NUMBER_FIELDS = new Set(["n"]);
+
+const fileToDataUrl = async (file) => {
+  const mime = (file && file.type) || "image/png";
+  const base64 = Buffer.from(await file.arrayBuffer()).toString("base64");
+  return `data:${mime};base64,${base64}`;
+};
+
+// 统一请求上游并把响应原样带回（JSON/文本按文本转发，二进制按流转发）
+async function forwardToUpstream (endpoint, body, apiKey, contentType = "application/json") {
+  const response = await fetch(`${BASE_URL}/${API_VERSION}/${endpoint}`, {
+    method: "POST",
+    headers: makeHeaders(apiKey, { "Content-Type": contentType }),
+    body,
+  });
+
+  const upstreamType = response.headers.get("content-type") || "";
+  if (upstreamType && !/json|text|event-stream/i.test(upstreamType)) {
+    return new Response(response.body, fixCors(upstreamHeaders(response)));
+  }
+
+  const text = await response.text();
+  console.log(`Upstream ${endpoint}:`, response.status, text.slice(0, 300));
+  return new Response(text, fixCors(upstreamHeaders(response)));
+}
+
+async function handleImageGenerations (request, apiKey) {
+  const raw = await request.text();
+  let body = raw;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && typeof parsed.model === "string") {
+      // 模型名同样只去掉 models/ 前缀，其余透传
+      parsed.model = normalizeModel(parsed.model, parsed.model);
+      body = JSON.stringify(parsed);
+    }
+  } catch (err) {
+    // 不是 JSON 就原样转发，让上游给出真实报错
+    console.warn("images/generations: 请求体不是 JSON，按原始内容转发");
+  }
+  return forwardToUpstream("images/generations", body, apiKey);
+}
+
+// 把 OpenAI 风格的 multipart 表单翻译成 xAI 的 JSON；已是 JSON 则原样透传
+async function buildEditsPayload (request) {
+  const contentType = request.headers.get("content-type") || "";
+
+  if (!contentType.includes("multipart/form-data")) {
+    const raw = await request.text();
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && typeof parsed.model === "string") {
+        parsed.model = normalizeModel(parsed.model, parsed.model);
+      }
+      return JSON.stringify(parsed);
+    } catch (err) {
+      throw new HttpError("/images/edits 需要 multipart/form-data 或 JSON 请求体", 400);
+    }
+  }
+
+  const form = await request.formData();
+  const payload = {};
+  const images = [];
+  let mask;
+  const ignored = [];
+
+  for (const [key, value] of form.entries()) {
+    if (typeof value === "string") {
+      if (key === "image" || key === "images") { images.push(value); continue; }  // 直接给 URL/base64 字符串
+      if (key === "mask") { mask = value; continue; }
+      if (IMAGE_EDIT_FIELDS.has(key)) {
+        payload[key] = IMAGE_EDIT_NUMBER_FIELDS.has(key) ? Number(value) : value;
+      } else {
+        ignored.push(key);   // 含 OpenAI 的 size/quality/style，xAI 不支持
+      }
+      continue;
+    }
+
+    // 文件字段：image / image[] / images / images[] / mask
+    const dataUrl = await fileToDataUrl(value);
+    if (key === "mask") { mask = dataUrl; }
+    else if (key.startsWith("image")) { images.push(dataUrl); }
+    else { ignored.push(key); }
+  }
+
+  if (ignored.length > 0) {
+    console.warn("images/edits: 已忽略 xAI 不支持的字段:", [...new Set(ignored)].join(", "));
+  }
+
+  if (typeof payload.model === "string") {
+    payload.model = normalizeModel(payload.model, payload.model);
+  }
+  if (images.length === 1) {
+    payload.image = { url: images[0], type: "image_url" };
+  } else if (images.length > 1) {
+    payload.images = images.slice(0, 3).map((url) => ({ url, type: "image_url" }));
+  } else {
+    throw new HttpError("image is required for /v1/images/edits", 400);
+  }
+  if (mask) {
+    payload.mask = { url: mask };
+  }
+
+  return JSON.stringify(payload);
+}
+
+async function handleImageEdits (request, apiKey) {
+  const body = await buildEditsPayload(request);
+  return forwardToUpstream("images/edits", body, apiKey);
 }
 
 const harmCategory = [
