@@ -71,16 +71,18 @@ async function handleAPIRequest(req: Request): Promise<Response> {
 
 async function handleRequest(req: Request): Promise<Response> {
   const url = new URL(req.url);
-  console.log('Request URL:', req.url);
+  // 去掉末尾斜杠，保证 /v1/models、/models、/v1/models/ 都能命中
+  const pathname = url.pathname.replace(/\/+$/, "") || "/";
+  console.log('Request:', req.method, pathname);
 
   // WebSocket 处理
   if (req.headers.get("Upgrade")?.toLowerCase() === "websocket") {
     return handleWebSocket(req);
   }
 
-  if (url.pathname.endsWith("/chat/completions") ||
-    url.pathname.endsWith("/embeddings") ||
-    url.pathname.endsWith("/models")) {
+  if (pathname.endsWith("/chat/completions") ||
+    pathname.endsWith("/embeddings") ||
+    pathname.endsWith("/models")) {
     return handleAPIRequest(req);
   }
 

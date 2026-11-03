@@ -17,7 +17,9 @@ export default {
           throw new HttpError("The specified HTTP method is not allowed for the requested resource", 400);
         }
       };
-      const { pathname } = new URL(request.url);
+      const { pathname: rawPathname } = new URL(request.url);
+      // 去掉末尾斜杠，保证 /models、/v1/models、/v1/models/ 都能命中
+      const pathname = rawPathname.replace(/\/+$/, "") || "/";
       switch (true) {
         case pathname.endsWith("/chat/completions"):
           assert(request.method === "POST");
@@ -54,6 +56,22 @@ const fixCors = ({ headers, status, statusText }) => {
   return { headers, status, statusText };
 };
 
+// 我们把上游响应体重新组装过（JSON 重新序列化 / 解压后的流），
+// 上游的 content-length、content-encoding 已经不再匹配，
+// 继续透传会让客户端按错误长度读取（截断或报错），因此统一裁掉。
+const upstreamHeaders = (response) => {
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  headers.delete("content-encoding");
+  return { headers, status: response.status, statusText: response.statusText };
+};
+
+const jsonResponse = (payload, response) => {
+  const result = upstreamHeaders(response);
+  result.headers.set("Content-Type", "application/json; charset=utf-8");
+  return new Response(payload, fixCors(result));
+};
+
 const handleOPTIONS = async () => {
   return new Response(null, {
     headers: {
@@ -64,8 +82,19 @@ const handleOPTIONS = async () => {
   });
 };
 
-const BASE_URL = "https://api.x.ai";
-const API_VERSION = "v1";
+// 允许通过环境变量覆盖上游地址（Deno Deploy 控制台 → Settings → Environment Variables）
+// 未授予 --allow-env 或运行在 Cloudflare Workers 等无 Deno 的环境时，自动回退到默认值
+const readEnv = (key, fallback) => {
+  try {
+    if (typeof Deno !== "undefined" && Deno.env?.get) {
+      return Deno.env.get(key) ?? fallback;
+    }
+  } catch (_) { /* 忽略权限错误，使用默认值 */ }
+  return fallback;
+};
+
+const BASE_URL = readEnv("XAI_BASE_URL", "https://api.x.ai").replace(/\/+$/, "");
+const API_VERSION = readEnv("XAI_API_VERSION", "v1").replace(/^\/+|\/+$/g, "");
 
 // https://github.com/google-gemini/generative-ai-js/blob/cf223ff4a1ee5a2d944c53cddb8976136382bee6/src/requests/request.ts#L71
 const API_CLIENT = "grok-proxy/0.1.0"; // 修改为我们自己的标识
@@ -75,25 +104,88 @@ const makeHeaders = (apiKey, more) => ({
   ...more
 });
 
+// 上游 200 但返回的列表为空/无法识别时的兜底，避免 new-api 侧模型列表彻底为空
+// （注意：这只是展示用，实际能用的模型以上游为准）
+const FALLBACK_MODELS = [
+  "grok-4",
+  "grok-4-fast",
+  "grok-3",
+  "grok-3-mini",
+  "grok-2-1212",
+  "grok-beta",
+];
+
+// 兼容不同上游的字段名：OpenAI/xAI 用 id，Gemini 风格用 name（形如 models/grok-4）
+const pickModelId = (item) => {
+  if (typeof item === "string") { return item; }
+  const raw = item?.id ?? item?.name ?? item?.model ?? "";
+  return String(raw);
+};
+
 async function handleModels (apiKey) {
   const response = await fetch(`${BASE_URL}/${API_VERSION}/models`, {
     headers: makeHeaders(apiKey),
   });
-  let { body } = response;
-  if (response.ok) {
-    const { models } = JSON.parse(await response.text());
-    body = JSON.stringify({
-      object: "list",
-      data: models.map(({ name }) => ({
-        id: name.replace("models/", ""),
-        object: "model",
-        created: 0,
-        owned_by: "",
-      })),
-    }, null, "  ");
+
+  // 只读一次 body：Response 的 body 是一次性流，重复调用 text() 会抛 "Body already consumed"
+  const text = await response.text();
+
+  if (!response.ok) {
+    // 上游报错（401/403/429…）时原样回传，让 new-api 日志里能看到真实原因
+    console.error("Upstream /models error:", response.status, text.slice(0, 500));
+    return new Response(text, fixCors(upstreamHeaders(response)));
   }
-  return new Response(body, fixCors(response));
+
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch (err) {
+    console.error("Failed to parse upstream /models response:", text.slice(0, 500));
+    return new Response(text, fixCors(upstreamHeaders(response)));
+  }
+
+  // 兼容三种上游结构：
+  //   1. OpenAI / xAI 标准：{ object: "list", data: [ { id, created, owned_by } ] }
+  //   2. 旧版/Gemini 风格：  { models: [ { name: "models/xxx" } ] }
+  //   3. 直接返回数组：      [ "grok-4" ] 或 [ { id: "grok-4" } ]
+  const list = Array.isArray(payload?.data)
+    ? payload.data
+    : Array.isArray(payload?.models)
+      ? payload.models
+      : Array.isArray(payload)
+        ? payload
+        : [];
+
+  const seen = new Set();
+  const data = [];
+  for (const item of list) {
+    const id = pickModelId(item).trim().replace(/^models\//, "");
+    if (!id || seen.has(id)) { continue; }
+    seen.add(id);
+    data.push({
+      id,
+      object: "model",
+      created: Number.isFinite(item?.created) ? item.created : 0,
+      owned_by: item?.owned_by ?? "xai",
+    });
+  }
+
+  if (data.length === 0) {
+    console.warn("Upstream /models returned no usable entries, falling back to FALLBACK_MODELS");
+    for (const id of FALLBACK_MODELS) {
+      data.push({ id, object: "model", created: 0, owned_by: "xai" });
+    }
+  }
+
+  return jsonResponse(JSON.stringify({ object: "list", data }), response);
 }
+
+// 把模型名归一化为上游可直接使用的形式：去掉 Gemini 风格的 "models/" 前缀，
+// 其余名字一律透传（不再静默替换成默认模型），交给上游判断是否有效。
+const normalizeModel = (raw, fallback) => {
+  if (typeof raw !== "string" || raw.trim() === "") { return fallback; }
+  return raw.trim().replace(/^models\//, "");
+};
 
 const DEFAULT_EMBEDDINGS_MODEL = "text-embedding-002";
 async function handleEmbeddings (req, apiKey) {
@@ -103,14 +195,9 @@ async function handleEmbeddings (req, apiKey) {
   if (!Array.isArray(req.input)) {
     req.input = [ req.input ];
   }
-  let model;
-  if (req.model.startsWith("models/")) {
-    model = req.model.substring(7);
-  } else {
-    req.model = DEFAULT_EMBEDDINGS_MODEL;
-    model = req.model;
-  }
-  
+  // 注意：xAI 目前没有公开 /v1/embeddings 端点，这里保留转发逻辑仅为兼容原有代码
+  const model = normalizeModel(req.model, DEFAULT_EMBEDDINGS_MODEL);
+
   const response = await fetch(`${BASE_URL}/${API_VERSION}/embeddings`, {
     method: "POST",
     headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
@@ -120,36 +207,22 @@ async function handleEmbeddings (req, apiKey) {
       "dimensions": req.dimensions
     })
   });
-  
-  return new Response(await response.text(), fixCors(response));
+
+  return new Response(await response.text(), fixCors(upstreamHeaders(response)));
 }
 
 const DEFAULT_MODEL = "grok-beta";
 async function handleCompletions (req, apiKey) {
-  let model = DEFAULT_MODEL;
-  switch(true) {
-    case typeof req.model !== "string":
-      break;
-    case req.model.startsWith("models/"):
-      model = req.model.substring(7);
-      break;
-    case req.model.startsWith("grok-"):
-      model = req.model;
-  }
-  
+  const model = normalizeModel(req.model, DEFAULT_MODEL);
+
   // Grok API 使用标准的 chat/completions 端点
   let url = `${BASE_URL}/${API_VERSION}/chat/completions`;
-  
+
   // 确保流式参数被正确传递
-  const requestBody = {...req};
-  
-  // 显式设置stream参数
-  if (req.stream) {
-    requestBody.stream = true;
-  }
-  
+  const requestBody = { ...req, model };
+
   console.log("Request Body:", JSON.stringify(requestBody));
-  
+
   const response = await fetch(url, {
     method: "POST",
     headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
@@ -157,15 +230,19 @@ async function handleCompletions (req, apiKey) {
   });
 
   if (!response.ok) {
-    // 如果响应不成功，直接返回错误信息
-    console.error("API Response Error:", await response.text());
-    return new Response(await response.text(), fixCors(response));
+    // 只读一次 body：重复调用 text() 会抛 "Body already consumed"，把上游错误变成 500
+    const errorText = await response.text();
+    console.error("API Response Error:", response.status, errorText);
+    return new Response(errorText, fixCors(upstreamHeaders(response)));
   }
 
   let body = response.body;
   const id = generateChatcmplId();
-  
+
   if (req.stream) {
+    if (!response.body) {
+      throw new HttpError("Upstream returned an empty streaming body", 502);
+    }
     // 处理流式响应
     console.log("处理流式响应");
     body = response.body
@@ -190,14 +267,14 @@ async function handleCompletions (req, apiKey) {
     try {
       const responseData = JSON.parse(responseText);
       body = processCompletionsResponse(responseData, model, id);
-      return new Response(body, fixCors(response));
+      return jsonResponse(body, response);
     } catch (err) {
       console.error("Error parsing response:", err);
-      return new Response(responseText, fixCors(response));
+      return new Response(responseText, fixCors(upstreamHeaders(response)));
     }
   }
-  
-  return new Response(body, fixCors(response));
+
+  return new Response(body, fixCors(upstreamHeaders(response)));
 }
 
 const harmCategory = [
@@ -428,32 +505,35 @@ const responseLineRE = /^data: (.*)(?:\n\n|\r\r|\r\n\r\n)/;
 async function parseStream (chunk, controller) {
   chunk = await chunk;
   if (!chunk) { return; }
-  
-  // 特殊处理[DONE]消息
-  if (chunk.includes('data: [DONE]')) {
-    controller.enqueue('data: [DONE]');
-    return;
-  }
-  
+
   this.buffer += chunk;
   do {
     const match = this.buffer.match(responseLineRE);
     if (!match) { break; }
-    controller.enqueue(match[1]);
+    // 先按行切分再判断结束标记：不能因为整块里含 "[DONE]" 就丢掉同一块中的最后一个数据帧
+    const line = match[1].trim();
     this.buffer = this.buffer.substring(match[0].length);
+    if (!line) { continue; }
+    if (line === "[DONE]") {
+      controller.enqueue("data: [DONE]");
+      this.buffer = "";
+      return;
+    }
+    controller.enqueue(line);
   } while (true); // eslint-disable-line no-constant-condition
 }
 
 async function parseStreamFlush (controller) {
-  if (this.buffer) {
-    if (this.buffer.includes('[DONE]')) {
-      controller.enqueue('data: [DONE]');
-    } else {
-      console.error("Invalid data:", this.buffer);
-      controller.enqueue(this.buffer);
-    }
-    this.buffer = '';
+  // 处理流末尾没有空行结尾的残余数据，去掉可能残留的 "data: " 前缀
+  const rest = (this.buffer || "").replace(/^data:\s?/, "").trim();
+  this.buffer = "";
+  if (!rest) { return; }
+  if (rest === "[DONE]") {
+    controller.enqueue("data: [DONE]");
+    return;
   }
+  console.error("Invalid trailing data:", rest.slice(0, 200));
+  controller.enqueue(rest);
 }
 
 function transformResponseStream (data, stop, first) {
@@ -496,9 +576,12 @@ async function toOpenAiStream (chunk, controller) {
   
   if (!line) { return; }
   
-  // 特殊处理[DONE]消息
+  // 特殊处理[DONE]消息（只发一次，避免和 flush 重复）
   if (line === 'data: [DONE]') {
-    controller.enqueue("data: [DONE]" + delimiter);
+    if (!this.done) {
+      this.done = true;
+      controller.enqueue("data: [DONE]" + delimiter);
+    }
     return;
   }
   
@@ -551,6 +634,9 @@ async function toOpenAiStreamFlush (controller) {
       }
     }
   }
-  // 确保发送结束标记
-  controller.enqueue("data: [DONE]" + delimiter);
+  // 确保发送结束标记（上游已经发过 [DONE] 时不再重复）
+  if (!this.done) {
+    this.done = true;
+    controller.enqueue("data: [DONE]" + delimiter);
+  }
 }

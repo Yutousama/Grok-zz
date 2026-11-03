@@ -3,7 +3,8 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "dev": "node src/index.js"
+    "dev": "node src/index.js",
+    "test": "node tests/smoke.mjs && node tests/routing.mjs"
   },
   "devDependencies": {}
 }

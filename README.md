@@ -27,6 +27,37 @@
 3. **WebSocket 支持**：实现了 WebSocket 协议转发，支持流式响应，保证实时交互体验。
 4. **错误处理机制**：优化的错误处理流程，确保请求失败时能够返回清晰的错误信息。
 
+## 接入 new-api / OpenAI 兼容客户端
+
+- Base URL 填代理域名即可，带不带 `/v1` 都能用：
+  - `https://your-project.deno.net`
+  - `https://your-project.deno.net/v1`
+  - 支持 `/v1/models`、`/models`，以及带末尾斜杠的 `/v1/models/`
+- API Key 填你在 [api.x.ai](https://api.x.ai) 生成的 `xai-...` Key（代理不做任何存储）。
+- 模型名会原样透传给上游（只去掉 `models/` 前缀），不再静默替换成默认模型；名字写错时直接看到上游的 400 报错，便于排查。
+- `/v1/models` 兼容上游的多种返回结构（`data` / `models` / 直接数组，`id` / `name` 字段都行）；上游返回空列表时兜底返回一组内置模型名，避免 new-api 里模型列表为空。
+
+### 可选环境变量
+
+在 Deno Deploy 控制台 → 项目 → Settings → Environment Variables 中配置，不配置则使用默认值：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `XAI_BASE_URL` | `https://api.x.ai` | 上游地址，可换成其它 xAI 兼容网关 |
+| `XAI_API_VERSION` | `v1` | 上游 API 版本段 |
+
+> 本地用 `deno run` 运行时需要加 `--allow-env` 才能读到这两个变量，读不到会自动使用默认值。
+
+## 本地自测
+
+```bash
+node tests/smoke.mjs     # 桩掉 fetch，验证上游各种返回格式/错误都不会让代理崩溃
+node tests/routing.mjs   # 用 Deno 桩加载 deno_index.ts，验证各路径路由
+# 或：npm test
+```
+
+用桩函数模拟上游各种返回（标准结构、缺失 `data`、Gemini 结构、401/400、流式帧），验证代理不会因上游格式变化而崩溃。
+
 ## 项目优点
 
 1. **全球无障碍访问**：突破地域限制，在任何网络环境下都能稳定访问 Grok API。
