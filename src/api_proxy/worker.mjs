@@ -113,14 +113,13 @@ const makeHeaders = (apiKey, more) => ({
 });
 
 // 上游 200 但返回的列表为空/无法识别时的兜底，避免 new-api 侧模型列表彻底为空
-// （注意：这只是展示用，实际能用的模型以上游为准）
+// （注意：这只是展示用，实际能用的模型以上游 /v1/models 为准，名单会随 xAI 更新而过时）
 const FALLBACK_MODELS = [
-  "grok-4",
-  "grok-4-fast",
-  "grok-3",
-  "grok-3-mini",
-  "grok-2-1212",
-  "grok-beta",
+  "grok-4.7",
+  "grok-4.6",
+  "grok-4.5",
+  "grok-imagine-image-2.0",
+  "grok-imagine-image",
 ];
 
 // 兼容不同上游的字段名：OpenAI/xAI 用 id，Gemini 风格用 name（形如 models/grok-4）

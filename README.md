@@ -32,7 +32,7 @@
 - Base URL 填代理域名即可，带不带 `/v1` 都能用：
   - `https://your-project.deno.net`
   - `https://your-project.deno.net/v1`
-  - 支持 `/v1/models`、`/models`，以及带末尾斜杠的 `/v1/models/`
+  - 支持 `/v1/models`、`/v1/chat/completions`、`/v1/images/generations`、`/v1/images/edits`，以及带末尾斜杠的写法
 - API Key 填你在 [api.x.ai](https://api.x.ai) 生成的 `xai-...` Key（代理不做任何存储）。
 - 模型名会原样透传给上游（只去掉 `models/` 前缀），不再静默替换成默认模型；名字写错时直接看到上游的 400 报错，便于排查。
 - `/v1/models` 兼容上游的多种返回结构（`data` / `models` / 直接数组，`id` / `name` 字段都行）；上游返回空列表时兜底返回一组内置模型名，避免 new-api 里模型列表为空。
@@ -46,10 +46,23 @@
 | `POST /v1/images/generations` | 文本生图 | `application/json` |
 | `POST /v1/images/edits` | 图生图 / 图片编辑 | **只接受 `application/json`**（multipart 会返回 415） |
 
-- 常用模型：`grok-2-image-1212`（经典生图）、`grok-imagine-image`（Imagine 系列，支持编辑与 `resolution`）；具体哪些模型对你的账户开放，以 `/v1/models` 与 xAI 控制台为准。
+- 常用模型：`grok-imagine-image` / `grok-imagine-image-2.0`（Imagine 系列，生图与编辑都走它，支持 `resolution: "1k"|"2k"`）。注意部分账户的模型列表里已经没有 `grok-2-image-1212`，具体以 `/v1/models` 与 xAI 控制台为准。
 - **edits 的格式差异已由代理处理**：OpenAI SDK / new-api 默认发 `multipart/form-data`，代理会转成 xAI 的 JSON（单图 `image: { url, type: "image_url" }`，多图 `images: [...]`（最多 3 张），`mask: { url }`，图片本体转成 `data:image/...;base64,...`）。直接发 JSON 时原样透传。
 - xAI 不支持 OpenAI 的 `size` / `quality` / `style`，这些字段会被丢弃（日志里会提示）；尺寸用 `aspect_ratio`，清晰度用 `resolution: "1k" | "2k"`。
-- 响应统一是 `{ created, data: [{ url | b64_json }] }`，与 OpenAI 一致；需要 base64 时传 `response_format: "b64_json"`。
+- 响应统一是 `{ created, data: [{ url | b64_json }] }`，与 OpenAI 一致；需要 base64 时传 `response_format: "b64_json"`（实测一张约 15 万字符的 base64，正常返回）。
+- 响应里还有 xAI 特有的 `usage.cost_in_usd_ticks` 与 `data[].mime_type`，代理原样保留，方便算成本。
+
+## 实测记录（走 Deno 代理）
+
+用真实 Key 通过 Deno 代理验证过（2026-11）：
+
+| 请求 | 结果 |
+| --- | --- |
+| `GET /v1/models` | 200，返回 xAI 当前模型列表（`grok-4.7` / `grok-4.6` / `grok-4.5` / `grok-4.20-*` / `grok-build-0.1` / `grok-imagine-image*` / `grok-imagine-video*`） |
+| `POST /v1/chat/completions`（`grok-4.7`，非流式） | 200，`choices[0].message.content` 正常 |
+| `POST /v1/chat/completions`（`stream: true`） | 200，SSE 正常，`[DONE]` 只出现一次 |
+| `POST /v1/images/generations`（`grok-imagine-image-2.0`，`url` / `b64_json`） | 200，返回 `data[0].url` / `data[0].b64_json` + `usage.cost_in_usd_ticks` |
+| `POST /v1/images/edits`（multipart 单图 + prompt，代理转 JSON） | 200，返回编辑后的图片 |
 
 ### 可选环境变量
 
